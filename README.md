@@ -1,31 +1,54 @@
-# @pipeworx/mcp-openalex
+# mcp-openalex
 
-MCP server for scholarly works, authors, and institutions via the [OpenAlex API](https://openalex.org/). Free, no authentication required.
+OpenAlex MCP — wraps the OpenAlex API (scholarly works, free, no auth)
+
+Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 250+ live data sources.
 
 ## Tools
 
 | Tool | Description |
 |------|-------------|
-| `search_works` | Search scholarly works (papers, books, datasets) by keyword |
-| `search_authors` | Search researchers and authors by name |
-| `search_institutions` | Search academic institutions by name |
-| `get_concept` | Look up an academic concept or field of study |
 
-## Quickstart via Pipeworx Gateway
+## Quick Start
 
-```bash
-curl -X POST https://gateway.pipeworx.io/mcp \
-  -H "Content-Type: application/json" \
-  -d '{
-    "jsonrpc": "2.0",
-    "method": "tools/call",
-    "params": {
-      "name": "openalex__search_works",
-      "arguments": { "query": "transformer neural networks", "limit": 5 }
-    },
-    "id": 1
-  }'
+Add to your MCP client (Claude Desktop, Cursor, Windsurf, etc.):
+
+```json
+{
+  "mcpServers": {
+    "openalex": {
+      "url": "https://gateway.pipeworx.io/openalex/mcp"
+    }
+  }
+}
 ```
+
+Or connect to the full Pipeworx gateway for access to all 250+ data sources:
+
+```json
+{
+  "mcpServers": {
+    "pipeworx": {
+      "url": "https://gateway.pipeworx.io/mcp"
+    }
+  }
+}
+```
+
+## Using with ask_pipeworx
+
+Instead of calling tools directly, you can ask questions in plain English:
+
+```
+ask_pipeworx({ question: "your question about Openalex data" })
+```
+
+The gateway picks the right tool and fills the arguments automatically.
+
+## More
+
+- [All tools and guides](https://github.com/pipeworx-io/examples)
+- [pipeworx.io](https://pipeworx.io)
 
 ## License
 
