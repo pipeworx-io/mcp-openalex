@@ -1,0 +1,18 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.pipeworx-io/openalex",
+  "title": "Openalex",
+  "description": "OpenAlex MCP — wraps the OpenAlex API (scholarly works, free, no auth)",
+  "version": "0.1.1",
+  "websiteUrl": "https://pipeworx.io/packs/openalex",
+  "repository": {
+    "url": "https://github.com/pipeworx-io/mcp-openalex",
+    "source": "github"
+  },
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://gateway.pipeworx.io/openalex/mcp"
+    }
+  ]
+}
