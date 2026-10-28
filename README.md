@@ -2,7 +2,7 @@
 
 OpenAlex is a free, open replacement for Microsoft Academic Graph (which shut down in 2022). 240M+ scholarly works with structured data on authors, institutions, concepts, citations, and venues. Open-source data model, generous API. Free, no auth (polite User-Agent + email recommended).
 
-Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1683+ live data sources.
+Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1856+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
 
 ## Why this matters for AI agents
 
@@ -13,6 +13,7 @@ Common flows:
 - **Work lookup.** Find a paper by DOI, title, or OpenAlex ID; get full structured record.
 - **Author / institution.** Search Yale's CS department's papers in 2024.
 - **Concept browsing.** Papers tagged with "transformer architecture" or "CRISPR Cas9."
+- **Journal publishing model.** Is a journal subscription, hybrid or open access? Look up by ISSN (print or electronic).
 - **Citation graph.** "Who cites paper X?" or "What does paper X cite?"
 
 Citable URI: `pipeworx://openalex/work/{work_id}`.
@@ -88,7 +89,7 @@ directly, instead of just this one's:
 }
 ```
 
-Both URLs reach the same gateway and the same 1683+ data sources. The
+Both URLs reach the same gateway and the same 1856+ data sources. The
 only difference is which pack's tools are listed **directly**; `ask_pipeworx`
 reaches all of them from either one.
 

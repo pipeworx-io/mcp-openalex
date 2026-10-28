@@ -295,10 +295,26 @@ async function httpErrorMessage(res: Response, name: string): Promise<string> {
   // internal-host-class.ts; no-op for every third-party upstream, which is why
   // this touches 481 packs' error text and changes none of it.
   return markInternalOrigin(
-    `${name}: ${res.status}${detailSuffix(await readDetail(res))}`,
+    `${name}: ${res.status}${detailSuffix(await readDetail(res))}${responseHints(res)}`,
     res.url,
     res.status,
   );
+}
+
+/**
+ * Facts about a FAILED response that live in its headers, not its body, appended
+ * so the gateway's classifier (which only ever sees this string) can tell a limit
+ * from a wall from a refusal (fleet #3477). Both are standard, both are absent on
+ * almost every response, and neither is invented: `Retry-After` is the server
+ * saying "come back later" (the one thing that makes a 403 a throttle), and
+ * Cloudflare marks a bot challenge with `cf-mitigated: challenge`.
+ */
+function responseHints(res: Response): string {
+  const hints: string[] = [];
+  const retryAfter = res.headers.get('retry-after');
+  if (retryAfter) hints.push(`retry-after: ${retryAfter.slice(0, 40)}`);
+  if ((res.headers.get('cf-mitigated') ?? '').toLowerCase() === 'challenge') hints.push('Cloudflare bot challenge (cf-mitigated: challenge)');
+  return hints.length ? ` (${hints.join('; ')})` : '';
 }
 
 /**
@@ -670,6 +686,254 @@ function pickMessage(node: unknown, depth: number): string | null {
 function collapse(s: string): string {
   return s.replace(/\s+/g, ' ').trim();
 }
+
+// ── Bounded readers — peak memory, not just wall time (fleet #3322) ──────
+//
+// `parseJson` above does `await res.text()` then `JSON.parse(raw)`, so a
+// multi-megabyte upstream body is held TWICE at peak: once as the raw string
+// and once as the object graph (which for an array of small objects runs
+// several times the byte size). Nothing in `workers/gateway` can see that
+// peak — it happens inside the pack, before any gateway code holds a payload —
+// which is why the gateway-side payload caps of #3293 and #3320 did not move
+// the 503/1102 rate at all.
+//
+// Measured on the live gateway, 2026-10-19, sha fa5de5c34, direct tools/call:
+//   statcan_list_cubes  8,049,566 B   <- one upstream array, no limit argument
+//   gnomad_gene BRCA1   2,732,706 B
+// Five of those in flight at the quality runner's width is ~40 MB of parse
+// peak against a 128 MB isolate; Cloudflare kills the isolate and every
+// request in flight returns 503/1102, which is why the victims look random.
+//
+// `readJsonArrayPrefix` is the fix for the dominant shape: an upstream that
+// returns one enormous top-level JSON array with no server-side paging. It
+// parses elements off the stream and DISCARDS the consumed bytes, so peak
+// retained memory is one element plus one chunk rather than the whole body,
+// and it cancels the body as soon as it has what it was asked for.
+
+/** Default ceiling for a single upstream JSON body read into an isolate.
+ *  Chosen so the known tail (statcan 8.0 MB, gnomad 2.7 MB) is bounded well
+ *  below the point where a handful of concurrent reads exhausts 128 MB. */
+const DEFAULT_MAX_JSON_BYTES = 1_500_000;
+
+interface JsonArrayPrefix<T> {
+  /** The decoded elements, at most `maxItems` of them. */
+  items: T[];
+  /** True when the upstream array had more elements than we read. */
+  truncated: boolean;
+  /** Bytes actually pulled off the socket — the number that bounds memory. */
+  bytesRead: number;
+  /** `Content-Length` if the upstream declared one, else null. */
+  declaredBytes: number | null;
+}
+
+/**
+ * Read the FIRST `maxItems` elements of a top-level JSON array off a response
+ * stream without ever materialising the whole body.
+ *
+ * Use this instead of `parseJson` when the upstream returns one big array and
+ * offers no `limit`/`offset` of its own. Peak retained memory is one element
+ * plus the current chunk; the body is cancelled as soon as `maxItems` is
+ * reached, so the remaining megabytes are never transferred at all.
+ *
+ *     const { items, truncated } = await readJsonArrayPrefix<Cube>(
+ *       res, 'StatCan WDS', { maxItems: limit + offset });
+ *
+ * `maxBytes` is a second, independent backstop for a pathological element (a
+ * single 50 MB object): hitting it stops the read and sets `truncated`, rather
+ * than throwing, because a partial answer plus an explicit truncated flag is
+ * more useful to a caller than an error.
+ */
+async function readJsonArrayPrefix<T>(
+  res: Response,
+  name: string,
+  opts: { maxItems: number; maxBytes?: number },
+): Promise<JsonArrayPrefix<T>> {
+  const maxBytes = opts.maxBytes ?? DEFAULT_MAX_JSON_BYTES;
+  const declaredRaw = Number(res.headers.get('content-length'));
+  const declaredBytes = Number.isFinite(declaredRaw) && declaredRaw > 0 ? declaredRaw : null;
+
+  // No streaming body available (a mock, or an already-buffered response):
+  // fall back to the whole-text path so behaviour stays correct, just unbounded.
+  if (!res.body) {
+    const all = await parseJson<T[]>(res, name);
+    if (!Array.isArray(all)) throw new Error(`upstream_down: ${name} returned ${typeof all} where a JSON array was expected.`);
+    return {
+      items: all.slice(0, opts.maxItems),
+      truncated: all.length > opts.maxItems,
+      bytesRead: declaredBytes ?? 0,
+      declaredBytes,
+    };
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  const items: T[] = [];
+
+  let buf = '';
+  let scan = 0;
+  let bytesRead = 0;
+  let started = false; // consumed the opening '['
+  let arrayEnded = false;
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  let elemStart = -1;
+  let truncated = false;
+
+  const push = (text: string) => {
+    const t = text.trim();
+    if (!t) return;
+    items.push(JSON.parse(t) as T);
+  };
+
+  try {
+    outer: while (items.length < opts.maxItems && !arrayEnded) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      bytesRead += value.byteLength;
+      buf += decoder.decode(value, { stream: true });
+      if (bytesRead > maxBytes) { truncated = true; break; }
+
+      for (; scan < buf.length; scan++) {
+        const ch = buf[scan];
+
+        if (inStr) {
+          if (esc) { esc = false; continue; }
+          if (ch === '\\') { esc = true; continue; }
+          if (ch === '"') inStr = false;
+          continue;
+        }
+
+        if (!started) {
+          if (ch === '[') { started = true; continue; }
+          if (ch.trim() === '') continue;
+          throw new Error(
+            `upstream_down: ${name} returned a body that does not begin with a JSON array (saw ${JSON.stringify(ch)}). ` +
+              'This reader is only for upstreams that answer with one top-level array.',
+          );
+        }
+
+        if (ch === '"') { if (depth === 0 && elemStart < 0) elemStart = scan; inStr = true; continue; }
+
+        if (ch === '{' || ch === '[') {
+          if (depth === 0 && elemStart < 0) elemStart = scan;
+          depth++;
+          continue;
+        }
+
+        if (ch === '}' || ch === ']') {
+          if (depth > 0) {
+            depth--;
+            if (depth === 0 && elemStart >= 0) {
+              push(buf.slice(elemStart, scan + 1));
+              elemStart = -1;
+              if (items.length >= opts.maxItems) { truncated = true; scan++; break outer; }
+            }
+            continue;
+          }
+          // depth 0 and a closing bracket: the end of the top-level array.
+          if (elemStart >= 0) { push(buf.slice(elemStart, scan)); elemStart = -1; }
+          arrayEnded = true;
+          break outer;
+        }
+
+        if (ch === ',' && depth === 0) {
+          if (elemStart >= 0) {
+            push(buf.slice(elemStart, scan));
+            elemStart = -1;
+            if (items.length >= opts.maxItems) { truncated = true; scan++; break outer; }
+          }
+          continue;
+        }
+
+        // A bare scalar element (number / true / false / null).
+        if (depth === 0 && elemStart < 0 && ch.trim() !== '') elemStart = scan;
+      }
+
+      // Drop everything already consumed. THIS is what bounds memory: without
+      // it `buf` grows to the full body and the reader is streaming in name only.
+      if (elemStart >= 0) {
+        buf = buf.slice(elemStart);
+        scan -= elemStart;
+        elemStart = 0;
+      } else {
+        buf = buf.slice(scan);
+        scan = 0;
+      }
+    }
+  } finally {
+    // Cancel rather than drain: the point is that the remaining megabytes are
+    // never transferred. A cancel on an already-finished body is a no-op.
+    await reader.cancel().catch(() => {});
+  }
+
+  return { items, truncated, bytesRead, declaredBytes };
+}
+
+/**
+ * `parseJson`, with a hard ceiling on how many bytes are read.
+ *
+ * For an upstream whose body is not a single array (so `readJsonArrayPrefix`
+ * does not apply) but which can still answer with megabytes. Unlike the array
+ * reader this one THROWS when the cap is hit, because a truncated prefix of an
+ * arbitrary JSON document is not parseable and there is no partial answer to
+ * hand back. A declared `Content-Length` over the cap is refused before a
+ * single chunk is read.
+ */
+async function parseJsonBounded<T>(
+  res: Response,
+  name: string,
+  maxBytes: number = DEFAULT_MAX_JSON_BYTES,
+): Promise<T> {
+  const declaredRaw = Number(res.headers.get('content-length'));
+  const declared = Number.isFinite(declaredRaw) && declaredRaw > 0 ? declaredRaw : null;
+
+  const tooBig = (n: number) =>
+    new Error(
+      `upstream_down: ${name} answered with ${n.toLocaleString()} bytes, over this pack's ${maxBytes.toLocaleString()}-byte ceiling. ` +
+        'The body is not read past the ceiling on purpose — a few concurrent reads of a body that size exhaust the ' +
+        'Worker isolate and take every other in-flight request down with them. Narrow the request (a smaller range, ' +
+        'a specific id, or a lower limit) and retry.',
+    );
+
+  if (declared !== null && declared > maxBytes) {
+    await res.body?.cancel().catch(() => {});
+    throw tooBig(declared);
+  }
+  if (!res.body) return parseJson<T>(res, name);
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let raw = '';
+  let bytesRead = 0;
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      bytesRead += value.byteLength;
+      if (bytesRead > maxBytes) throw tooBig(bytesRead);
+      raw += decoder.decode(value, { stream: true });
+    }
+    raw += decoder.decode();
+  } finally {
+    await reader.cancel().catch(() => {});
+  }
+
+  if (!raw.trim()) {
+    throw new Error(
+      `upstream_down: ${name} answered HTTP ${res.status} with an EMPTY body where JSON was expected. ` +
+        'Nothing about the request can cause this — it is an upstream fault, and the same call may well work on retry.',
+    );
+  }
+  try {
+    return JSON.parse(raw) as T;
+  } catch {
+    throw new Error(
+      `upstream_down: ${name} answered HTTP ${res.status} with a body that is not valid JSON. ` +
+        `It begins: ${stripMarkup(raw).slice(0, 120) || '(unreadable)'}`,
+    );
+  }
+}
 /**
  * OpenAlex MCP — wraps the OpenAlex API (scholarly works, free, no auth)
  *
@@ -927,6 +1191,20 @@ const tools: McpToolExport['tools'] = [
       required: ['id'],
     },
   },
+  {
+    name: 'get_journal_publishing_model',
+    description:
+      'Is a journal subscription, hybrid or fully open access? Look up a journal by ISSN (print or electronic, e.g. "0025-1461" or "1864-1547") and get its publisher, article-processing charge, whether the Directory of Open Access Journals lists it, and the open-access status mix of its recent articles (gold, diamond, hybrid, bronze, green, closed), with a derived model label: open_access, hybrid or subscription. The label is inferred from article-level evidence, not declared by the publisher.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        issn: { type: 'string', description: 'Journal ISSN, print or electronic, e.g. "1864-1547"' },
+        years: { type: 'number', description: 'Look-back window in years for the article mix (1-15, default 5)' },
+        _apiKey: { type: 'string', description: 'OpenAlex API key. Optional — Pipeworx supplies one; pass your own to bill your account instead.' },
+      },
+      required: ['issn'],
+    },
+  },
 ];
 
 // ── Tool Implementations ──────────────────────────────────────────────
@@ -1052,6 +1330,92 @@ async function getWork(id: string, apiKey?: string) {
   };
 }
 
+async function getJournalPublishingModel(issnRaw: string, years: number, apiKey?: string) {
+  const issn = String(issnRaw ?? '').trim().toUpperCase().replace(/^ISSN\s*/, '');
+  if (!/^\d{4}-?\d{3}[\dX]$/.test(issn)) {
+    throw new Error(`"issn" must look like "1864-1547" (8 digits, optional hyphen, last may be X). Got "${issnRaw}".`);
+  }
+  const canon = issn.includes('-') ? issn : `${issn.slice(0, 4)}-${issn.slice(4)}`;
+  const win = Math.min(15, Math.max(1, Math.round(years)));
+
+  const sres = await openAlexFetch(`/sources/issn:${canon}`, new URLSearchParams(), apiKey);
+  if (sres.status === 404) throw new Error(`No journal found for ISSN ${canon}. Check the number, or try the other (print/electronic) ISSN.`);
+  if (!sres.ok) throw await httpError(sres, 'OpenAlex source lookup error');
+  const src = (await sres.json()) as Record<string, any>;
+  const sid = String(src.id ?? '').split('/').pop();
+
+  const toYear = new Date().getUTCFullYear();
+  const gres = await openAlexFetch(
+    '/works',
+    new URLSearchParams({
+      filter: `primary_location.source.id:${sid},publication_year:${toYear - win + 1}-${toYear}`,
+      group_by: 'open_access.oa_status',
+    }),
+    apiKey,
+  );
+  if (!gres.ok) throw await httpError(gres, 'OpenAlex works status mix error');
+  const gdata = (await gres.json()) as { group_by?: Array<{ key: string; count: number }> };
+  const mix: Record<string, number> = {};
+  let total = 0;
+  for (const g of gdata.group_by ?? []) {
+    mix[g.key] = g.count;
+    total += g.count;
+  }
+
+  // DOAJ is the authority for "fully open access". It is consulted best-effort:
+  // an outage is reported as 'unavailable', never as 'not_listed'.
+  let doaj: 'listed' | 'not_listed' | 'unavailable' = 'unavailable';
+  try {
+    const d = await pwFetch(`https://doaj.org/api/v3/search/journals/${encodeURIComponent('issn:' + canon)}?pageSize=1`, { headers: { Accept: 'application/json' } });
+    if (d.ok) {
+      const dj = (await d.json()) as { total?: number };
+      doaj = (dj.total ?? 0) > 0 ? 'listed' : 'not_listed';
+    }
+  } catch {
+    /* leave unavailable */
+  }
+  const inDoaj = doaj === 'listed' || src.is_in_doaj === true;
+
+  const notListed = doaj === 'unavailable' ? 'Not flagged as DOAJ-listed by OpenAlex (the DOAJ directory itself was unreachable)' : 'Not DOAJ-listed';
+  const openish = (mix.gold ?? 0) + (mix.diamond ?? 0);
+  const hybrid = mix.hybrid ?? 0;
+  let model: 'open_access' | 'hybrid' | 'subscription' | 'unknown';
+  let basis: string;
+  if (inDoaj || src.is_oa === true) {
+    model = 'open_access';
+    basis = inDoaj ? 'Listed in the Directory of Open Access Journals.' : 'Publisher-level open-access flag set in OpenAlex.';
+  } else if (total === 0) {
+    model = 'unknown';
+    basis = `No articles indexed in the last ${win} years to judge from.`;
+  } else if (hybrid + openish > 0) {
+    model = 'hybrid';
+    basis = `${notListed}, but ${hybrid + openish} of ${total} articles in the last ${win} years were openly available through the publisher.`;
+  } else {
+    model = 'subscription';
+    basis = `${notListed} and none of ${total} articles in the last ${win} years were open at the publisher (only closed, bronze or green copies).`;
+  }
+
+  return {
+    issn: canon,
+    journal: src.display_name ?? null,
+    issn_l: src.issn_l ?? null,
+    issns: src.issn ?? [],
+    publisher: src.host_organization_name ?? null,
+    publishing_model: model,
+    basis,
+    doaj_listed: doaj,
+    openalex_flag_is_oa: src.is_oa ?? null,
+    apc: { usd: src.apc_usd ?? null, listed: src.apc_prices ?? [] },
+    articles_window: `${toYear - win + 1}-${toYear}`,
+    articles_total: total,
+    articles_by_oa_status: mix,
+    homepage_url: src.homepage_url ?? null,
+    data_as_of: src.updated_date ?? null,
+    source: 'OpenAlex, sources and works open-access status; DOAJ, Directory of Open Access Journals',
+    caveat: 'Model label is inferred from article-level open-access status and DOAJ listing; the publisher\'s own current policy page is authoritative.',
+  };
+}
+
 // ── Dispatcher ────────────────────────────────────────────────────────
 
 async function callTool(name: string, args: Record<string, unknown>): Promise<unknown> {
@@ -1067,6 +1431,8 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
       return getConcept(args.query as string, apiKey);
     case 'get_scholarly_work':
       return getWork(args.id as string, apiKey);
+    case 'get_journal_publishing_model':
+      return getJournalPublishingModel(args.issn as string, (args.years as number) ?? 5, apiKey);
     default:
       throw new Error(`Unknown tool: ${name}`);
   }
