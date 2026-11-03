@@ -1,6 +1,6 @@
 {
   "name": "@pipeworx/mcp-openalex",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "OpenAlex MCP — wraps the OpenAlex API (scholarly works, free, no auth)",
   "type": "module",
   "main": "lib/index.js",
@@ -27,7 +27,7 @@
     "mode": "gateway",
     "slug": "openalex",
     "gatewaySlug": "openalex",
-    "sourceHash": "v1-ea247f4626e1b019368b32e1d266114a0baa354cc58a80b9fd158ad9ce007870",
-    "sourceCommit": "b2c4383545bb35171d0ada2beb1c9c7168ea175e"
+    "sourceHash": "v1-6a15f27f193ac0fba14e215842127e73468392173bd75dea74c42b2bfd405aa0",
+    "sourceCommit": "bed7faa04e7276899b5e3870ef11c98625371f2b"
   }
 }
